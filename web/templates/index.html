@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="sv">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>HopScale</title>
+
+    <link
+        rel="stylesheet"
+        href="{{ url_for('static', filename='style.css') }}"
+    >
+</head>
+
+<body>
+
+    <div class="scale-container">
+
+        <div class="hop-icon">🌿</div>
+
+        <h1>HopScale</h1>
+
+        <div class="subtitle">
+            Hop Weighing System
+        </div>
+
+        <div class="weight-display">
+            <span id="weight">--- g</span>
+        </div>
+
+        <button id="tare-button" onclick="tareScale()">
+            TARE
+        </button>
+
+        <div id="message"></div>
+
+        <div id="timestamp">
+            Väntar på data...
+        </div>
+
+    </div>
+
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+
+</body>
+
+</html>
