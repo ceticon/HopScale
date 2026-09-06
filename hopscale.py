@@ -3,7 +3,10 @@ import time
 import statistics
 import json
 import os
+
 from datetime import datetime
+from RPLCD.i2c import CharLCD
+from gpiozero import Button
 
 
 # ============================================================
@@ -13,10 +16,18 @@ from datetime import datetime
 DATA_PIN = 21
 CLOCK_PIN = 26
 
+TARE_BUTTON_PIN = 17
+
 NUM_SAMPLES = 10
 READ_INTERVAL = 0.5
 
 CALIBRATION_FACTOR = 1063.1
+
+LCD_ADDRESS = 0x27
+LCD_OFF_DELAY = 5.0
+
+# LCD släcks när vikten varit under denna nivå
+LCD_WEIGHT_LIMIT = 1.0
 
 
 # ============================================================
@@ -30,12 +41,31 @@ CONTROL_FILE = os.path.join(BASE_DIR, "control.json")
 
 
 # ============================================================
+# LCD
+# ============================================================
+
+lcd = CharLCD(
+    i2c_expander="PCF8574",
+    address=LCD_ADDRESS,
+    port=1,
+    cols=20,
+    rows=4,
+    charmap="A00",
+    auto_linebreaks=False
+)
+
+
+# ============================================================
 # HOPSCALE
 # ============================================================
 
 class HopScale:
 
     def __init__(self):
+
+        # ----------------------------------------------------
+        # GPIO för HX711
+        # ----------------------------------------------------
 
         GPIO.setmode(GPIO.BCM)
 
@@ -44,46 +74,129 @@ class HopScale:
 
         GPIO.output(CLOCK_PIN, GPIO.LOW)
 
+        # ----------------------------------------------------
+        # TARE-knapp
+        # ----------------------------------------------------
+
+        # Knappen sitter mellan GPIO17 och GND.
+        # Intern pull-up används.
+        self.tare_button = Button(
+            TARE_BUTTON_PIN,
+            pull_up=True,
+            bounce_time=0.1
+        )
+
+        # För att upptäcka ett nytt knapptryck
+        self.tare_button_was_pressed = False
+
+        # ----------------------------------------------------
+        # Interna värden
+        # ----------------------------------------------------
+
         self.tare_offset = 0.0
 
+        # Tidpunkt när vikten gick under LCD_WEIGHT_LIMIT
+        self.lcd_below_limit_since = None
+
+        # ----------------------------------------------------
+        # Start
+        # ----------------------------------------------------
+
         print("Initierar HX711...")
+
+        lcd.backlight_enabled = True
+
+        self.lcd_message(
+            "      HopScale",
+            "",
+            "     Starting...",
+            ""
+        )
+
         time.sleep(1.0)
 
         self.reset()
 
-    # --------------------------------------------------------
-    # Reset av HX711
-    # --------------------------------------------------------
+    # ========================================================
+    # LCD
+    # ========================================================
+
+    def lcd_message(
+        self,
+        line1="",
+        line2="",
+        line3="",
+        line4=""
+    ):
+
+        try:
+
+            lines = [
+                line1,
+                line2,
+                line3,
+                line4
+            ]
+
+            for row, text in enumerate(lines):
+
+                lcd.cursor_pos = (row, 0)
+
+                # Skriv exakt 20 tecken så gammal text
+                # skrivs över.
+                lcd.write_string(
+                    str(text)[:20].ljust(20)
+                )
+
+        except Exception as error:
+
+            print(f"LCD-fel: {error}")
+
+    # ========================================================
+    # RESET HX711
+    # ========================================================
 
     def reset(self):
 
-        GPIO.output(CLOCK_PIN, GPIO.HIGH)
+        GPIO.output(
+            CLOCK_PIN,
+            GPIO.HIGH
+        )
 
-        # HX711 går i power-down om SCK hålls hög > 60 µs
+        # HX711 går i power-down om SCK hålls hög > 60 us
         time.sleep(0.005)
 
-        GPIO.output(CLOCK_PIN, GPIO.LOW)
+        GPIO.output(
+            CLOCK_PIN,
+            GPIO.LOW
+        )
 
         time.sleep(0.1)
 
-    # --------------------------------------------------------
-    # Vänta tills HX711 har data
-    # --------------------------------------------------------
+    # ========================================================
+    # VÄNTA PÅ HX711
+    # ========================================================
 
-    def wait_ready(self, timeout=1.0):
+    def wait_ready(
+        self,
+        timeout=1.0
+    ):
 
         start_time = time.time()
 
         while GPIO.input(DATA_PIN) == GPIO.HIGH:
 
-            if time.time() - start_time > timeout:
+            if (
+                time.time() - start_time
+                > timeout
+            ):
                 return False
 
         return True
 
-    # --------------------------------------------------------
-    # Läs ett råvärde
-    # --------------------------------------------------------
+    # ========================================================
+    # LÄS ETT RÅVÄRDE
+    # ========================================================
 
     def read_raw(self):
 
@@ -95,18 +208,32 @@ class HopScale:
         # Läs 24 bitar
         for _ in range(24):
 
-            GPIO.output(CLOCK_PIN, GPIO.HIGH)
+            GPIO.output(
+                CLOCK_PIN,
+                GPIO.HIGH
+            )
 
             value = value << 1
 
-            GPIO.output(CLOCK_PIN, GPIO.LOW)
+            GPIO.output(
+                CLOCK_PIN,
+                GPIO.LOW
+            )
 
             if GPIO.input(DATA_PIN):
                 value += 1
 
-        # Extra puls = Channel A, gain 128
-        GPIO.output(CLOCK_PIN, GPIO.HIGH)
-        GPIO.output(CLOCK_PIN, GPIO.LOW)
+        # Extra puls:
+        # Channel A, gain 128
+        GPIO.output(
+            CLOCK_PIN,
+            GPIO.HIGH
+        )
+
+        GPIO.output(
+            CLOCK_PIN,
+            GPIO.LOW
+        )
 
         # Konvertera 24-bit signed integer
         if value & 0x800000:
@@ -114,9 +241,9 @@ class HopScale:
 
         return value
 
-    # --------------------------------------------------------
-    # Läs flera råvärden och filtrera
-    # --------------------------------------------------------
+    # ========================================================
+    # FILTRERA RÅVÄRDEN
+    # ========================================================
 
     def read_filtered_raw(self):
 
@@ -139,13 +266,26 @@ class HopScale:
 
         return statistics.mean(samples)
 
-    # --------------------------------------------------------
-    # Tarera vågen
-    # --------------------------------------------------------
+    # ========================================================
+    # TARERA
+    # ========================================================
 
     def tare(self):
 
         print("Tarerar vågen...")
+
+        # Tänd displayen vid tarering
+        lcd.backlight_enabled = True
+
+        # Nollställ LCD-timern
+        self.lcd_below_limit_since = None
+
+        self.lcd_message(
+            "      HopScale",
+            "",
+            "     TARING...",
+            "    Please wait"
+        )
 
         tare_samples = []
 
@@ -159,18 +299,41 @@ class HopScale:
         if len(tare_samples) == 0:
 
             print("Tarering misslyckades.")
+
+            self.lcd_message(
+                "      HopScale",
+                "",
+                "    TARE ERROR",
+                ""
+            )
+
             return False
 
-        self.tare_offset = statistics.mean(tare_samples)
+        self.tare_offset = statistics.mean(
+            tare_samples
+        )
 
-        print(f"Tare offset: {self.tare_offset:.1f}")
+        print(
+            f"Tare offset: "
+            f"{self.tare_offset:.1f}"
+        )
+
         print("Tarering klar.")
+
+        self.lcd_message(
+            "      HopScale",
+            "",
+            "   Tare complete",
+            ""
+        )
+
+        time.sleep(0.5)
 
         return True
 
-    # --------------------------------------------------------
-    # Läs vikt i gram
-    # --------------------------------------------------------
+    # ========================================================
+    # LÄS VIKT
+    # ========================================================
 
     def get_weight(self):
 
@@ -179,55 +342,192 @@ class HopScale:
         if raw_value is None:
             return None, None, None
 
-        difference = raw_value - self.tare_offset
+        difference = (
+            raw_value
+            - self.tare_offset
+        )
 
-        weight = difference / CALIBRATION_FACTOR
+        weight = (
+            difference
+            / CALIBRATION_FACTOR
+        )
 
         # Små variationer runt noll sätts till 0
         if abs(weight) < 0.2:
             weight = 0.0
 
-        return raw_value, difference, round(weight, 1)
+        return (
+            raw_value,
+            difference,
+            round(weight, 1)
+        )
 
-    # --------------------------------------------------------
-    # Skriv hopscale.json
-    # --------------------------------------------------------
+    # ========================================================
+    # FYSISK TARE-KNAPP
+    # ========================================================
 
-    def write_json(self, weight):
+    def check_tare_button(self):
+
+        # Knappen är nedtryckt
+        if self.tare_button.is_pressed:
+
+            # Bara reagera på själva övergången
+            # från inte tryckt -> tryckt
+            if not self.tare_button_was_pressed:
+
+                self.tare_button_was_pressed = True
+
+                print()
+                print(
+                    ">>> TARE-KNAPP TRYCKT <<<"
+                )
+                print(
+                    "Tarering begärd från "
+                    "fysisk knapp..."
+                )
+
+                success = self.tare()
+
+                if success:
+
+                    print(
+                        "Knapp-tarering klar."
+                    )
+                    print()
+
+        else:
+
+            # Knappen har släppts och kan
+            # registreras igen nästa gång.
+            self.tare_button_was_pressed = False
+
+    # ========================================================
+    # UPPDATERA LCD
+    # ========================================================
+
+    def update_lcd_weight(
+        self,
+        weight
+    ):
+
+        # ----------------------------------------------------
+        # LCD-belysning
+        # ----------------------------------------------------
+
+        if weight >= LCD_WEIGHT_LIMIT:
+
+            lcd.backlight_enabled = True
+
+            self.lcd_below_limit_since = None
+
+        else:
+
+            # Starta släck-timern
+            if (
+                self.lcd_below_limit_since
+                is None
+            ):
+
+                self.lcd_below_limit_since = (
+                    time.monotonic()
+                )
+
+            elapsed = (
+                time.monotonic()
+                - self.lcd_below_limit_since
+            )
+
+            if elapsed >= LCD_OFF_DELAY:
+
+                lcd.backlight_enabled = False
+
+        # ----------------------------------------------------
+        # LCD-text
+        # ----------------------------------------------------
+
+        weight_text = (
+            f"{weight:.1f} g"
+        )
+
+        self.lcd_message(
+            "      HopScale",
+            "",
+            f"Weight: {weight_text}",
+            "       READY"
+        )
+
+    # ========================================================
+    # SKRIV HOPSCALE.JSON
+    # ========================================================
+
+    def write_json(
+        self,
+        weight
+    ):
 
         data = {
             "weight_g": weight,
-            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "timestamp":
+                datetime.now().strftime(
+                    "%Y-%m-%d %H:%M:%S"
+                )
         }
 
         try:
 
-            with open(JSON_FILE, "w") as file:
-                json.dump(data, file, indent=4)
+            with open(
+                JSON_FILE,
+                "w"
+            ) as file:
+
+                json.dump(
+                    data,
+                    file,
+                    indent=4
+                )
 
         except Exception as error:
 
-            print(f"Fel vid skrivning av hopscale.json: {error}")
+            print(
+                "Fel vid skrivning av "
+                f"hopscale.json: {error}"
+            )
 
-    # --------------------------------------------------------
-    # Kontrollera control.json
-    # --------------------------------------------------------
+    # ========================================================
+    # WEBB-TARE VIA CONTROL.JSON
+    # ========================================================
 
     def check_control(self):
 
         try:
 
-            if not os.path.exists(CONTROL_FILE):
+            if not os.path.exists(
+                CONTROL_FILE
+            ):
                 return
 
-            with open(CONTROL_FILE, "r") as file:
+            with open(
+                CONTROL_FILE,
+                "r"
+            ) as file:
+
                 data = json.load(file)
 
-            if data.get("tare", False):
+            if data.get(
+                "tare",
+                False
+            ):
 
                 print()
-                print(">>> TARE-KOMMANDO MOTTAGET <<<")
-                print("Tarering begärd från webbsidan...")
+                print(
+                    ">>> TARE-KOMMANDO "
+                    "MOTTAGET <<<"
+                )
+
+                print(
+                    "Tarering begärd från "
+                    "webbsidan..."
+                )
 
                 success = self.tare()
 
@@ -235,23 +535,60 @@ class HopScale:
 
                     data["tare"] = False
 
-                    with open(CONTROL_FILE, "w") as file:
-                        json.dump(data, file, indent=4)
+                    with open(
+                        CONTROL_FILE,
+                        "w"
+                    ) as file:
 
-                    print("Webbtarering klar.")
-                    print("control.json återställd till tare=false")
+                        json.dump(
+                            data,
+                            file,
+                            indent=4
+                        )
+
+                    print(
+                        "Webbtarering klar."
+                    )
+
+                    print(
+                        "control.json "
+                        "återställd till "
+                        "tare=false"
+                    )
+
                     print()
 
         except Exception as error:
 
-            print(f"Fel vid läsning av control.json: {error}")
+            print(
+                "Fel vid läsning av "
+                f"control.json: {error}"
+            )
 
-    # --------------------------------------------------------
-    # Cleanup
-    # --------------------------------------------------------
+    # ========================================================
+    # CLEANUP
+    # ========================================================
 
     def cleanup(self):
 
+        # Stäng gpiozero-knappen
+        try:
+            self.tare_button.close()
+        except Exception:
+            pass
+
+        # Släck och stäng LCD
+        try:
+
+            lcd.backlight_enabled = False
+            lcd.clear()
+            lcd.close(clear=True)
+
+        except Exception:
+
+            pass
+
+        # Städa HX711 GPIO
         GPIO.cleanup()
 
 
@@ -273,28 +610,63 @@ if __name__ == "__main__":
 
         scale = HopScale()
 
-        print("Väntar på stabilisering...")
+        print(
+            "Väntar på stabilisering..."
+        )
+
+        scale.lcd_message(
+            "      HopScale",
+            "",
+            "   Stabilizing...",
+            ""
+        )
+
         time.sleep(2.0)
 
         print()
-        print("Se till att vågen är TOM.")
+        print(
+            "Se till att vågen är TOM."
+        )
         print()
 
         if not scale.tare():
-            raise RuntimeError("Kunde inte tarera vågen.")
+
+            raise RuntimeError(
+                "Kunde inte tarera vågen."
+            )
 
         print()
         print("HopScale är redo.")
-        print("Tryck Ctrl+C för att avsluta.")
+        print(
+            "Tryck Ctrl+C för att avsluta."
+        )
         print()
+
+        # ====================================================
+        # HUVUDLOOP
+        # ====================================================
 
         while True:
 
-            # Kontrollera om webbsidan begärt tarering
+            # -----------------------------------------------
+            # Fysisk TARE-knapp
+            # -----------------------------------------------
+
+            scale.check_tare_button()
+
+            # -----------------------------------------------
+            # Webbtarering
+            # -----------------------------------------------
+
             scale.check_control()
 
-            # Läs aktuell vikt
-            raw, diff, weight = scale.get_weight()
+            # -----------------------------------------------
+            # Läs vikt
+            # -----------------------------------------------
+
+            raw, diff, weight = (
+                scale.get_weight()
+            )
 
             if raw is not None:
 
@@ -304,28 +676,62 @@ if __name__ == "__main__":
                     f"Vikt: {weight:7.1f} g"
                 )
 
-                # Uppdatera hopscale.json
-                scale.write_json(weight)
+                # JSON
+                scale.write_json(
+                    weight
+                )
+
+                # LCD
+                scale.update_lcd_weight(
+                    weight
+                )
 
             else:
 
-                print("Ingen giltig mätning från HX711")
+                print(
+                    "Ingen giltig mätning "
+                    "från HX711"
+                )
 
-            time.sleep(READ_INTERVAL)
+                lcd.backlight_enabled = True
+
+                scale.lcd_below_limit_since = None
+
+                scale.lcd_message(
+                    "      HopScale",
+                    "",
+                    "    HX711 ERROR",
+                    ""
+                )
+
+            time.sleep(
+                READ_INTERVAL
+            )
 
     except KeyboardInterrupt:
 
         print()
-        print("Avslutar HopScale...")
+        print(
+            "Avslutar HopScale..."
+        )
 
     except Exception as error:
 
         print()
-        print(f"Fel: {error}")
+        print(
+            f"Fel: {error}"
+        )
 
     finally:
 
         if scale is not None:
+
             scale.cleanup()
 
-        print("GPIO städat.")
+        else:
+
+            GPIO.cleanup()
+
+        print(
+            "GPIO städat."
+        )

@@ -1,14 +1,14 @@
 # HopScale 🌿⚖️
 
-HopScale is a Raspberry Pi based digital scale designed for weighing hops during homebrewing.
+HopScale is a Raspberry Pi based digital scale designed for accurately weighing hops during homebrewing.
 
-The project uses a **1 kg load cell** connected through an **HX711 ADC** to a Raspberry Pi. Weight measurements are filtered and calibrated in Python and made available through a simple Flask-based web interface.
+The project uses a **1 kg load cell** connected through an **HX711 24-bit ADC** to a Raspberry Pi. Weight measurements are filtered and calibrated in Python and displayed both on a local **20×4 LCD** and through a Flask-based web interface.
 
-The scale currently provides a resolution of **0.1 g**, making it suitable for measuring hop additions during brewing.
+The scale displays weight with a resolution of **0.1 g**, making it well suited for measuring hop additions during brewing.
 
 ## Web Interface
 
-The current HopScale web interface displays the measured weight in real time and provides a remote **TARE** function.
+The HopScale web interface displays the measured weight in real time and provides a remote **TARE** function.
 
 ![HopScale Web Interface](docs/images/hopscale_web.png)
 
@@ -23,7 +23,10 @@ The interface can be opened from computers, tablets, or mobile phones connected 
 * Multiple-sample averaging
 * Minimum and maximum sample rejection
 * Automatic tare at startup
+* Physical TARE button
 * Remote TARE from the web interface
+* 20×4 LCD display
+* Automatic LCD backlight control
 * JSON status output
 * Flask web server
 * Live weight updates using JavaScript
@@ -36,8 +39,12 @@ The current hardware consists of:
 * Raspberry Pi
 * HX711 load cell amplifier / ADC
 * 1 kg load cell
+* 2004A 20×4 character LCD with I²C interface
+* Momentary push button for TARE
 
-### GPIO Connections
+## GPIO Connections
+
+### HX711
 
 | HX711 | Raspberry Pi             |
 | ----- | ------------------------ |
@@ -46,12 +53,118 @@ The current hardware consists of:
 | VCC   | Appropriate HX711 supply |
 | GND   | GND                      |
 
-The software uses BCM GPIO numbering.
+### TARE Button
+
+The physical TARE button is connected between:
+
+| Button     | Raspberry Pi |
+| ---------- | ------------ |
+| Terminal 1 | GPIO 17      |
+| Terminal 2 | GND          |
+
+The software uses the Raspberry Pi internal pull-up resistor through `gpiozero`.
+
+No external pull-up resistor is required.
+
+### LCD 2004A
+
+The LCD uses an I²C backpack at address:
+
+```text
+0x27
+```
+
+Connections:
+
+| LCD I²C | Raspberry Pi |
+| ------- | ------------ |
+| SDA     | GPIO 2       |
+| SCL     | GPIO 3       |
+| GND     | GND          |
+| VCC     | LCD supply   |
+
+The I²C address can be checked with:
+
+```bash
+i2cdetect -y 1
+```
+
+A typical result for the current display is:
+
+```text
+27
+```
+
+## LCD Display
+
+During normal operation, the LCD displays the current weight:
+
+```text
+      HopScale
+
+Weight: 44.8 g
+       READY
+```
+
+During tare:
+
+```text
+      HopScale
+
+     TARING...
+    Please wait
+```
+
+The LCD backlight automatically turns on when the measured weight reaches **1.0 g or more**.
+
+When the weight falls below 1.0 g, a timer starts. If the weight remains below the limit for **5 seconds**, the backlight is switched off.
+
+The delay is configured in `hopscale.py`:
 
 ```python
-DATA_PIN = 21
-CLOCK_PIN = 26
+LCD_OFF_DELAY = 5.0
 ```
+
+The backlight is automatically switched on during a tare operation.
+
+## TARE Functions
+
+HopScale can be tared in three ways.
+
+### Automatic Startup Tare
+
+When `hopscale.py` starts, the scale automatically performs a tare operation.
+
+The weighing platform should therefore be empty during startup.
+
+### Physical TARE Button
+
+Pressing the button connected between **GPIO17 and GND** performs a new tare operation.
+
+This allows HopScale to be used without opening the web interface.
+
+### Web TARE
+
+The web interface includes a **TARE** button.
+
+When pressed:
+
+1. JavaScript sends a POST request to Flask.
+2. Flask writes a tare request to `control.json`.
+3. `hopscale.py` detects the request.
+4. A new tare offset is calculated.
+5. `control.json` is reset to `false`.
+6. The displayed weight returns to approximately `0.0 g`.
+
+Example:
+
+```json
+{
+    "tare": false
+}
+```
+
+Both the physical button and web interface use the same tare function in `hopscale.py`.
 
 ## Calibration
 
@@ -108,6 +221,7 @@ HopScale/
 │   │   └── style.css
 │   └── templates/
 │       └── index.html
+├── .gitignore
 ├── control.json
 ├── hopscale.json
 ├── hopscale.py
@@ -117,33 +231,47 @@ HopScale/
 
 ## Software Architecture
 
-HopScale separates the scale process from the web server.
-
 ```text
-1 kg Load Cell
+                         ┌── 20x4 LCD
+                         │
+1 kg Load Cell           │
+      │                  │
+      ▼                  │
+    HX711                │
+      │                  │
+      ▼                  │
+ hopscale.py ─────────────┘
       │
-      ▼
-    HX711
+      ├──────────► hopscale.json
+      │                  │
+      │                  ▼
+      │               Flask
+      │                  │
+      │                  ▼
+      │            Web Interface
+      │                  │
+      │               TARE
+      │                  │
+      ◄── control.json ◄─┘
+      ▲
       │
-      ▼
- hopscale.py
-      │
-      ├──────────────► hopscale.json
-      │                     │
-      │                     ▼
-      │                  Flask
-      │                     │
-      │                     ▼
-      │                Web Interface
-      │                     │
-      │                  TARE
-      │                     │
-      ◄──── control.json ◄──┘
+GPIO17 TARE Button
 ```
 
-`hopscale.py` is responsible for communicating with the HX711, filtering measurements, calculating weight, handling tare commands, and updating the JSON status file.
+`hopscale.py` handles:
 
-The Flask application reads the JSON status and provides it to the browser.
+* HX711 communication
+* Measurement filtering
+* Weight calculation
+* Calibration
+* Tare operations
+* Physical TARE button
+* LCD display
+* LCD backlight control
+* JSON status updates
+* Web control commands
+
+Flask provides the connection between `hopscale.py` and the browser.
 
 ## JSON Status
 
@@ -162,45 +290,24 @@ Example:
 }
 ```
 
-The Flask web server exposes this information through:
+The Flask server exposes this through:
 
 ```text
 /api/status
 ```
 
-The browser periodically reads this endpoint and updates the displayed weight without reloading the page.
-
-## Remote Tare
-
-The web interface includes a **TARE** button.
-
-When the button is pressed:
-
-1. JavaScript sends a POST request to Flask.
-2. Flask writes a tare request to `control.json`.
-3. `hopscale.py` detects the request.
-4. A new tare offset is calculated.
-5. `control.json` is reset.
-6. The displayed weight returns to approximately `0.0 g`.
-
-Example control file:
-
-```json
-{
-    "tare": false
-}
-```
+JavaScript periodically reads this endpoint and updates the displayed weight without reloading the page.
 
 ## Installation
 
-Clone the repository and enter the project directory:
+Clone the repository:
 
 ```bash
 git clone <repository-url>
 cd HopScale
 ```
 
-Create a Python virtual environment:
+Create a virtual environment:
 
 ```bash
 python3 -m venv myenv
@@ -212,17 +319,34 @@ Activate it:
 source myenv/bin/activate
 ```
 
-Install the required Python packages:
+Install the required packages:
 
 ```bash
 pip install -r requirements.txt
 ```
 
+I²C must be enabled on the Raspberry Pi for the LCD.
+
+It can be enabled using:
+
+```bash
+sudo raspi-config
+```
+
+Then select the I²C interface under the interface options.
+
+The LCD can be detected using:
+
+```bash
+sudo apt install i2c-tools
+i2cdetect -y 1
+```
+
 ## Running HopScale
 
-HopScale consists of two processes.
+HopScale consists of two main processes.
 
-### 1. Start the scale
+### 1. Start the Scale
 
 From the project directory:
 
@@ -231,30 +355,9 @@ source myenv/bin/activate
 python hopscale.py
 ```
 
-The scale initializes the HX711 and automatically performs a tare operation during startup.
+Make sure the weighing platform is empty during startup because HopScale automatically performs a tare.
 
-Make sure the scale is unloaded during startup.
-
-A typical terminal output looks like:
-
-```text
-==============================
-          HopScale
-==============================
-
-Initierar HX711...
-Väntar på stabilisering...
-
-Se till att vågen är TOM.
-
-Tarerar vågen...
-Tare offset: 25448.8
-Tarering klar.
-
-HopScale är redo.
-```
-
-### 2. Start the web server
+### 2. Start the Web Server
 
 Open another terminal:
 
@@ -277,31 +380,37 @@ For example:
 http://192.168.1.100:5000
 ```
 
-Replace the example IP address with the actual IP address of your Raspberry Pi.
+Replace the example address with the actual IP address of the Raspberry Pi.
 
-## Requirements
+## Python Dependencies
 
-The Python dependencies are stored in:
+The project uses several Python packages including:
+
+* Flask
+* RPi.GPIO
+* gpiozero
+* RPLCD
+* smbus2
+
+The complete working environment is stored in:
 
 ```text
 requirements.txt
 ```
 
-They can be recreated from the working virtual environment with:
+After adding or updating dependencies, it can be regenerated with:
 
 ```bash
 pip freeze > requirements.txt
 ```
 
-The project uses RPi.GPIO for direct communication with the HX711 instead of an external HX711 Python library.
-
 ## Notes
 
-HopScale is designed primarily for weighing hops for homebrewing.
+HopScale is designed primarily for weighing hops during homebrewing.
 
-The current combination of a 1 kg load cell, HX711, sample filtering, and calibration provides stable measurements around the range typically used for hop additions.
+Displayed resolution is 0.1 g. Actual accuracy depends on the load cell, HX711 module, mechanical construction, electrical noise, temperature, and calibration.
 
-Displayed resolution is 0.1 g. Actual accuracy depends on the load cell, HX711 module, mechanical construction, temperature, electrical noise, and calibration.
+The current 1 kg load cell and HX711 combination has shown good linearity in tests between 7 g and 70 g.
 
 ## Future Ideas
 
@@ -309,11 +418,13 @@ Possible future improvements include:
 
 * Calibration from the web interface
 * Configurable calibration factor
-* Improved stability detection
-* Automatic service startup using systemd
+* Stability indicator
+* Automatic startup using systemd
 * Brewing recipe integration
 * Hop addition presets
-* Additional hardware documentation and wiring diagrams
+* Additional hardware documentation
+* Wiring diagram / Fritzing drawing
+* Enclosure design
 
 ## License
 
